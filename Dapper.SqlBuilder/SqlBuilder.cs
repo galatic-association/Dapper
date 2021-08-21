@@ -1,50 +1,102 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace Dapper
 {
     public class SqlBuilder
     {
-        private readonly Dictionary<string, Clauses> _data = new Dictionary<string, Clauses>();
+        private readonly Dictionary<string, DefaultStatementBuilder> _data = new Dictionary<string, DefaultStatementBuilder>();
+        private WhereStatementBuilder _whereBuilder;
+
         private int _seq;
 
-        private class Clause
+        private interface IClause
+        {
+            string Sql { get; set; }
+            object Parameters { get; set; }
+        }
+
+        private class Clause : IClause
         {
             public string Sql { get; set; }
             public object Parameters { get; set; }
-            public bool IsInclusive { get; set; }
         }
 
-        private class Clauses : List<Clause>
+        private class WhereClause : IClause
         {
-            private readonly string _joiner, _prefix, _postfix;
+            public string Joiner { get; set; }
+            public string Sql { get; set; }
+            public object Parameters { get; set; }
+        }
 
-            public Clauses(string joiner, string prefix = "", string postfix = "")
+        private interface IStatementBuilder
+        {
+            string Resolve(DynamicParameters p);
+        }
+
+        private abstract class SqlStatementBuilder<T> : IStatementBuilder
+            where T : IClause
+        {
+            protected SqlStatementBuilder(string prefix, string postfix)
             {
-                _joiner = joiner;
-                _prefix = prefix;
-                _postfix = postfix;
+                Clauses = new List<T>();
+                Prefix = prefix;
+                Postfix = postfix;
             }
 
-            public string ResolveClauses(DynamicParameters p)
+            protected List<T> Clauses { get; }
+            protected string Prefix { get; }
+            protected string Postfix { get; }
+
+            public abstract string Resolve(DynamicParameters p);
+
+            public void Append(T clause) => 
+                Clauses.Add(clause);
+        }
+
+        private sealed class WhereStatementBuilder : SqlStatementBuilder<WhereClause>
+        {
+            public WhereStatementBuilder() :
+                base("WHERE ", "\n")
+            { }
+
+            public override string Resolve(DynamicParameters p)
             {
-                foreach (var item in this)
+                var whereStatement = new StringBuilder();
+                whereStatement.Append(Prefix);
+
+                for (var i = 0; i < Clauses.Count; i++)
                 {
-                    p.AddDynamicParams(item.Parameters);
+                    var clause = Clauses[i];
+
+                    p.AddDynamicParams(clause.Parameters);
+
+                    if (i > 0)
+                        whereStatement.Append(clause.Joiner);
+
+                    whereStatement.Append(clause.Sql);
                 }
-                return this.Any(a => a.IsInclusive)
-                    ? _prefix +
-                      string.Join(_joiner,
-                          this.Where(a => !a.IsInclusive)
-                              .Select(c => c.Sql)
-                              .Union(new[]
-                              {
-                                  " ( " +
-                                  string.Join(" OR ", this.Where(a => a.IsInclusive).Select(c => c.Sql).ToArray()) +
-                                  " ) "
-                              }).ToArray()) + _postfix
-                    : _prefix + string.Join(_joiner, this.Select(c => c.Sql).ToArray()) + _postfix;
+
+                return whereStatement.Append(Postfix).ToString();
+            }
+        }
+
+        private sealed class DefaultStatementBuilder : SqlStatementBuilder<Clause>
+        {
+            private readonly string _joiner;
+
+            public DefaultStatementBuilder(string joiner, string prefix, string postfix) : base(prefix, postfix)
+                => _joiner = joiner;
+
+            public override string Resolve(DynamicParameters p)
+            {
+                foreach (var clause in Clauses)
+                    p.AddDynamicParams(clause.Parameters);
+
+                return $"{ Prefix }{string.Join(_joiner, Clauses.Select(c => c.Sql).ToArray())}{ Postfix }";
             }
         }
 
@@ -72,10 +124,9 @@ namespace Dapper
 
                     rawSql = _sql;
 
-                    foreach (var pair in _builder._data)
-                    {
-                        rawSql = rawSql.Replace("/**" + pair.Key + "**/", pair.Value.ResolveClauses(p));
-                    }
+                    foreach (var pair in _builder.Data)
+                        rawSql = rawSql.Replace($"/**{pair.Key}**/", pair.Value.Resolve(p));
+
                     parameters = p;
 
                     // replace all that is left with empty
@@ -99,59 +150,75 @@ namespace Dapper
             }
         }
 
+        private IEnumerable<KeyValuePair<string, IStatementBuilder>> Data
+        {
+            get
+            {
+                foreach (var item in _data)
+                    yield return new KeyValuePair<string, IStatementBuilder>(item.Key, item.Value);
+                yield return new KeyValuePair<string, IStatementBuilder>("where", _whereBuilder);
+            }
+        }
+
         public Template AddTemplate(string sql, dynamic parameters = null) =>
             new Template(this, sql, parameters);
 
-        protected SqlBuilder AddClause(string name, string sql, object parameters, string joiner, string prefix = "", string postfix = "", bool isInclusive = false)
+        protected SqlBuilder AddClause(string name, string sql, object parameters, string joiner, string prefix = "", string postfix = "")
         {
-            if (!_data.TryGetValue(name, out Clauses clauses))
+            if (name == "where")
             {
-                clauses = new Clauses(joiner, prefix, postfix);
-                _data[name] = clauses;
+                _whereBuilder ??= new WhereStatementBuilder();
+                _whereBuilder.Append(new WhereClause { Sql = sql, Parameters = parameters, Joiner = joiner });
             }
-            clauses.Add(new Clause { Sql = sql, Parameters = parameters, IsInclusive = isInclusive });
+            else
+            {
+                if (!_data.TryGetValue(name, out var _))
+                    _data[name] = new DefaultStatementBuilder(joiner, prefix, postfix);
+
+                _data[name].Append(new Clause { Sql = sql, Parameters = parameters });
+            }
+
             _seq++;
             return this;
         }
 
         public SqlBuilder Intersect(string sql, dynamic parameters = null) =>
-            AddClause("intersect", sql, parameters, "\nINTERSECT\n ", "\n ", "\n", false);
+            AddClause("intersect", sql, parameters, "\nINTERSECT\n ", "\n ", "\n");
 
         public SqlBuilder InnerJoin(string sql, dynamic parameters = null) =>
-            AddClause("innerjoin", sql, parameters, "\nINNER JOIN ", "\nINNER JOIN ", "\n", false);
+            AddClause("innerjoin", sql, parameters, "\nINNER JOIN ", "\nINNER JOIN ", "\n");
 
         public SqlBuilder LeftJoin(string sql, dynamic parameters = null) =>
-            AddClause("leftjoin", sql, parameters, "\nLEFT JOIN ", "\nLEFT JOIN ", "\n", false);
+            AddClause("leftjoin", sql, parameters, "\nLEFT JOIN ", "\nLEFT JOIN ", "\n");
 
         public SqlBuilder RightJoin(string sql, dynamic parameters = null) =>
-            AddClause("rightjoin", sql, parameters, "\nRIGHT JOIN ", "\nRIGHT JOIN ", "\n", false);
+            AddClause("rightjoin", sql, parameters, "\nRIGHT JOIN ", "\nRIGHT JOIN ", "\n");
 
         public SqlBuilder Where(string sql, dynamic parameters = null) =>
-            AddClause("where", sql, parameters, " AND ", "WHERE ", "\n", false);
+            AddClause("where", sql, parameters, " AND ");
 
         public SqlBuilder OrWhere(string sql, dynamic parameters = null) =>
-            AddClause("where", sql, parameters, " OR ", "WHERE ", "\n", true);
+            AddClause("where", sql, parameters, " OR ");
 
         public SqlBuilder OrderBy(string sql, dynamic parameters = null) =>
-            AddClause("orderby", sql, parameters, " , ", "ORDER BY ", "\n", false);
+            AddClause("orderby", sql, parameters, " , ", "ORDER BY ", "\n");
 
         public SqlBuilder Select(string sql, dynamic parameters = null) =>
-            AddClause("select", sql, parameters, " , ", "", "\n", false);
+            AddClause("select", sql, parameters, " , ", "", "\n");
 
         public SqlBuilder AddParameters(dynamic parameters) =>
-            AddClause("--parameters", "", parameters, "", "", "", false);
+            AddClause("--parameters", "", parameters, "", "", "");
 
         public SqlBuilder Join(string sql, dynamic parameters = null) =>
-            AddClause("join", sql, parameters, "\nJOIN ", "\nJOIN ", "\n", false);
+            AddClause("join", sql, parameters, "\nJOIN ", "\nJOIN ", "\n");
 
         public SqlBuilder GroupBy(string sql, dynamic parameters = null) =>
-            AddClause("groupby", sql, parameters, " , ", "\nGROUP BY ", "\n", false);
+            AddClause("groupby", sql, parameters, " , ", "\nGROUP BY ", "\n");
 
         public SqlBuilder Having(string sql, dynamic parameters = null) =>
-            AddClause("having", sql, parameters, "\nAND ", "HAVING ", "\n", false);
+            AddClause("having", sql, parameters, "\nAND ", "HAVING ", "\n");
 
         public SqlBuilder Set(string sql, dynamic parameters = null) =>
-             AddClause("set", sql, parameters, " , ", "SET ", "\n", false);
-
+            AddClause("set", sql, parameters, " , ", "SET ", "\n");
     }
 }
